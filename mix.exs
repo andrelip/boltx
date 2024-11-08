@@ -1,7 +1,7 @@
 defmodule Boltx.Mixfile do
   use Mix.Project
 
-  @version "0.0.6"
+  @version "0.0.7"
   @url_docs "https://hexdocs.pm/boltx"
   @url_github "https://github.com/sagastume/boltx"
 
@@ -83,7 +83,7 @@ defmodule Boltx.Mixfile do
   # Type "mix help deps" for more examples and options
   defp deps do
     [
-      {:db_connection, "~> 2.6.0"},
+      {:db_connection, "~> 2.7.0"},
       {:jason, "~> 1.4", optional: true},
       {:poison, "~> 6.0", optional: true},
 
