@@ -1,6 +1,33 @@
 defmodule Boltx do
   @moduledoc """
-  Bolt driver for Elixir.
+  Bolt driver for Elixir with Neo4j cluster support.
+
+  ## Basic Usage (Single Server)
+
+      {:ok, conn} = Boltx.start_link(
+        uri: "bolt+s://localhost:7687",
+        auth: [username: "neo4j", password: "password"]
+      )
+
+      {:ok, result} = Boltx.query(conn, "MATCH (n) RETURN n LIMIT 10")
+
+  ## Cluster Usage (Neo4j Aura / Causal Cluster)
+
+  For Neo4j clusters, use the `Boltx.Routing.Pool` which provides:
+  - Automatic routing of read queries to followers and write queries to the leader
+  - Retry logic for `NotALeader` errors
+  - Automatic refresh of routing tables
+
+      {:ok, pool} = Boltx.Routing.Pool.start_link(
+        uri: "neo4j+s://cluster.example.com:7687",
+        auth: [username: "neo4j", password: "password"]
+      )
+
+      # Read queries route to followers
+      {:ok, result} = Boltx.Routing.Pool.query(pool, "MATCH (n) RETURN n", %{}, mode: :read)
+
+      # Write queries route to the leader
+      {:ok, result} = Boltx.Routing.Pool.query(pool, "CREATE (n:Test) RETURN n", %{}, mode: :write)
   """
 
   @type conn() :: DBConnection.conn()

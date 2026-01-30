@@ -24,7 +24,8 @@ defmodule Boltx.Client do
     ResetMessage,
     GoodbyeMessage,
     DiscardMessage,
-    LogoffMessage
+    LogoffMessage,
+    RouteMessage
   }
 
   defstruct [:sock, :bolt_version]
@@ -446,6 +447,72 @@ defmodule Boltx.Client do
 
       _ ->
         {:error, :db_ping_failed}
+    end
+  end
+
+  @doc """
+  Retrieves the routing table from the Neo4j cluster.
+
+  For Bolt 4.3+, uses the native ROUTE message.
+  For older versions, falls back to the dbms.routing.getRoutingTable procedure.
+
+  Returns the routing table map with "servers" and "ttl" keys.
+  """
+  def send_route(client, routing_context \\ %{}, bookmarks \\ [], database \\ nil) do
+    if RouteMessage.supported?(client.bolt_version) do
+      send_route_message(client, routing_context, bookmarks, database)
+    else
+      send_route_procedure(client, routing_context, database)
+    end
+  end
+
+  defp send_route_message(client, routing_context, bookmarks, database) do
+    payload = RouteMessage.encode(client.bolt_version, routing_context, bookmarks, database)
+
+    with :ok <- send_packet(client, payload) do
+      recv_packets(client, &RouteMessage.prepare_messages/2, :infinity)
+    end
+  end
+
+  defp send_route_procedure(client, routing_context, database) do
+    # Fall back to procedure call for Bolt < 4.3
+    query =
+      if database do
+        "CALL dbms.routing.getRoutingTable($context, $database)"
+      else
+        "CALL dbms.routing.getRoutingTable($context)"
+      end
+
+    params =
+      if database do
+        %{context: routing_context, database: database}
+      else
+        %{context: routing_context}
+      end
+
+    # Execute on system database
+    extra = %{db: "system", mode: "r"}
+
+    case run_statement(client, query, params, extra) do
+      {:ok, statement_result(result_pull: pull_result(records: records))} when records != [] ->
+        # The procedure returns a single row with the routing table
+        [routing_info | _] = records
+
+        # Convert the row to a map - the procedure returns [ttl, servers]
+        routing_map =
+          case routing_info do
+            %{} = map -> map
+            [ttl, servers] -> %{"ttl" => ttl, "servers" => servers}
+            _ -> %{}
+          end
+
+        {:ok, routing_map}
+
+      {:ok, _} ->
+        {:error, Boltx.Error.wrap(__MODULE__, :no_routing_info)}
+
+      {:error, _} = error ->
+        error
     end
   end
 
