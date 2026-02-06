@@ -109,6 +109,32 @@ defmodule Boltx.Routing.Pool do
 
   # GenServer callbacks
 
+  # DBConnection options that should be forwarded to per-server pools
+  @forwarded_db_connection_opts [
+    :idle_interval,
+    :idle_limit,
+    :backoff_type,
+    :backoff_min,
+    :backoff_max,
+    :queue_target,
+    :queue_interval,
+    :queue_timeout,
+    :ownership_timeout,
+    :connect_timeout,
+    :timeout,
+    :pool_timeout,
+    :after_connect_timeout
+  ]
+
+  # Boltx connection options that should be forwarded to per-server pools
+  @forwarded_boltx_opts [
+    :ssl,
+    :ssl_opts,
+    :user_agent,
+    :versions,
+    :socket_options
+  ]
+
   @impl true
   def init(opts) do
     uri = Keyword.fetch!(opts, :uri)
@@ -118,11 +144,12 @@ defmodule Boltx.Routing.Pool do
     parsed_uri = URI.parse(uri)
     initial_address = "#{parsed_uri.host}:#{parsed_uri.port || 7687}"
 
-    # Build base config for connections
-    config = [
-      uri: uri,
-      auth: auth
-    ]
+    # Preserve the full connection config so per-server pools inherit tuning
+    connection_opts =
+      Keyword.take(opts, @forwarded_db_connection_opts ++ @forwarded_boltx_opts)
+
+    config =
+      [uri: uri, auth: auth] ++ connection_opts
 
     # Start the router
     router_opts = [
@@ -191,13 +218,30 @@ defmodule Boltx.Routing.Pool do
         # Select a server for this operation
         case Router.select_server(state.router, database, mode) do
           {:ok, address} ->
-            execute_on_server(state, address, statement, params, opts, mode, database, retry_count)
+            execute_on_server(
+              state,
+              address,
+              statement,
+              params,
+              opts,
+              mode,
+              database,
+              retry_count
+            )
 
           {:error, :no_writers_available} when mode == :write ->
             # Refresh and retry
             case Router.refresh_routing_table(state.router, database) do
               {:ok, _table} ->
-                execute_with_routing(state, statement, params, opts, mode, database, retry_count + 1)
+                execute_with_routing(
+                  state,
+                  statement,
+                  params,
+                  opts,
+                  mode,
+                  database,
+                  retry_count + 1
+                )
 
               {:error, reason} ->
                 {:error, reason}
@@ -230,7 +274,17 @@ defmodule Boltx.Routing.Pool do
             {:ok, result}
 
           {:error, %Error{} = error} ->
-            handle_query_error(state, error, address, statement, params, opts, mode, database, retry_count)
+            handle_query_error(
+              state,
+              error,
+              address,
+              statement,
+              params,
+              opts,
+              mode,
+              database,
+              retry_count
+            )
 
           {:error, reason} ->
             {:error, reason}
@@ -244,7 +298,17 @@ defmodule Boltx.Routing.Pool do
     end
   end
 
-  defp handle_query_error(state, error, address, statement, params, opts, mode, database, retry_count) do
+  defp handle_query_error(
+         state,
+         error,
+         address,
+         statement,
+         params,
+         opts,
+         mode,
+         database,
+         retry_count
+       ) do
     cond do
       Error.not_a_leader?(error) ->
         # Remove from writers and retry
@@ -301,13 +365,19 @@ defmodule Boltx.Routing.Pool do
     original_uri = Keyword.get(state.config, :uri)
     parsed_uri = URI.parse(original_uri)
 
-    pool_config = [
-      hostname: host,
-      port: port,
-      scheme: parsed_uri.scheme,
-      auth: Keyword.get(state.config, :auth),
-      pool_size: state.pool_size
-    ]
+    # Forward all connection tuning options from the parent config
+    inherited_opts =
+      Keyword.take(state.config, @forwarded_db_connection_opts ++ @forwarded_boltx_opts)
+
+    pool_config =
+      inherited_opts ++
+        [
+          hostname: host,
+          port: port,
+          scheme: parsed_uri.scheme,
+          auth: Keyword.get(state.config, :auth),
+          pool_size: state.pool_size
+        ]
 
     case Boltx.start_link(pool_config) do
       {:ok, pool} ->
