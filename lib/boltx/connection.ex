@@ -118,13 +118,25 @@ defmodule Boltx.Connection do
         end
 
         {:error, error, state}
+
+      # Transport-level failures (socket closed, timeout, reset, ...) come back
+      # as a bare `{:error, reason}` tuple. The pooled connection is now dead,
+      # so tell DBConnection to drop and replace it instead of letting this fall
+      # through to a CaseClauseError (which the rescue below would turn into a
+      # bad return value and crash the caller).
+      {:error, reason} ->
+        {:disconnect, Boltx.Error.wrap(__MODULE__, reason), state}
     end
   rescue
+    # A raised exception inside execute/4 means the Bolt framing may be
+    # desynced; the connection can no longer be trusted, so disconnect it.
+    # Always return a 3-tuple to honour the DBConnection callback contract.
     e in Boltx.Error ->
-      {:error, %{code: :failure, message: "#{e.message}, code: #{e.code}"}, state}
+      {:disconnect, e, state}
 
     e ->
-      {:error, %{code: :failure, message: e}}
+      {:disconnect,
+       Boltx.Error.wrap(__MODULE__, %{code: "failure", message: Exception.message(e)}), state}
   end
 
   defp result(
