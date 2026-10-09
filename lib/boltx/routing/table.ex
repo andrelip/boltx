@@ -26,14 +26,14 @@ defmodule Boltx.Routing.Table do
   @type address :: String.t()
 
   @type t :: %__MODULE__{
-    database: String.t() | nil,
-    routers: [address()],
-    readers: [address()],
-    writers: [address()],
-    ttl: non_neg_integer(),
-    last_updated_at: integer() | nil,
-    initialized_without_writers: boolean()
-  }
+          database: String.t() | nil,
+          routers: [address()],
+          readers: [address()],
+          writers: [address()],
+          ttl: non_neg_integer(),
+          last_updated_at: integer() | nil,
+          initialized_without_writers: boolean()
+        }
 
   @doc """
   Creates a new routing table for a database.
@@ -141,6 +141,15 @@ defmodule Boltx.Routing.Table do
   end
 
   @doc """
+  Servers that can serve `access_mode`. Reads fall back to the writers when
+  the table has no readers.
+  """
+  @spec servers_for(t(), :read | :write) :: [address()]
+  def servers_for(%__MODULE__{writers: writers}, :write), do: writers
+  def servers_for(%__MODULE__{readers: [], writers: writers}, :read), do: writers
+  def servers_for(%__MODULE__{readers: readers}, :read), do: readers
+
+  @doc """
   Updates the routing table with new information.
   """
   @spec update(t(), t()) :: t()
@@ -170,10 +179,11 @@ defmodule Boltx.Routing.Table do
   """
   @spec deactivate_server(t(), address()) :: t()
   def deactivate_server(%__MODULE__{} = table, address) do
-    %{table |
-      routers: List.delete(table.routers, address),
-      readers: List.delete(table.readers, address),
-      writers: List.delete(table.writers, address)
+    %{
+      table
+      | routers: List.delete(table.routers, address),
+        readers: List.delete(table.readers, address),
+        writers: List.delete(table.writers, address)
     }
   end
 

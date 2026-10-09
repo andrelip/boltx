@@ -2,112 +2,80 @@ defmodule Boltx.Routing.Pool do
   @moduledoc """
   A routing-aware connection pool for Neo4j clusters.
 
-  This module provides:
-  - Connection pooling per server in the cluster
-  - Automatic routing of read queries to followers and write queries to the leader
-  - Retry logic for NotALeader errors
-  - Automatic refresh of routing tables
+  - Read queries go to followers and write queries to the leader.
+  - `NotALeader` and other retryable cluster errors are retried on another server.
+  - Routing tables are refreshed when they expire.
 
   ## Usage
 
-      # Start a routing pool
       {:ok, pool} = Boltx.Routing.Pool.start_link(
         uri: "neo4j+s://cluster.example.com:7687",
         auth: [username: "neo4j", password: "password"]
       )
 
-      # Execute a read query (routes to followers)
       {:ok, result} = Boltx.Routing.Pool.query(pool, "MATCH (n) RETURN n", %{}, mode: :read)
-
-      # Execute a write query (routes to leader)
       {:ok, result} = Boltx.Routing.Pool.query(pool, "CREATE (n:Test) RETURN n", %{})
+
+  ## How it stays up
+
+  The pool process only answers "which server, which connection pool" from
+  memory. The query itself — and any retry — runs in the caller, so queries run
+  concurrently, up to `:pool_size` per server, and a slow query never holds
+  anyone else up.
+
+  Routing tables are fetched by a supervised task with a hard deadline
+  (`:routing_timeout` per router tried). Concurrent requests for the same
+  database share one refresh. An expired table that still has servers for the
+  requested mode keeps serving while it is refreshed in the background; only a
+  request with no usable server waits, and it gets `{:error, %Boltx.Error{}}` —
+  never an exit — if the refresh fails or overruns.
+
+  Per-server connection pools live under a supervisor of their own. One that
+  dies is started again on its next use; the routing pool itself is unaffected.
   """
 
   use GenServer
   require Logger
 
+  alias Boltx.Error
   alias Boltx.Routing.{Router, Table}
-  alias Boltx.{Error, Response}
 
   @default_pool_size 10
   @default_max_retries 3
   @default_retry_delay 100
+  @default_routing_timeout 5_000
+  @default_timeout 30_000
+
+  # Headroom on top of the per-router attempts before a refresh is abandoned.
+  @refresh_slack 500
+
+  # A failed background refresh is not retried sooner than this, so a stale
+  # table under load does not hammer a struggling router.
+  @refresh_backoff 1_000
 
   defstruct [
-    :router,
     :config,
+    :initial_address,
     :database,
-    :pools_table,
+    :servers_sup,
+    :tasks_sup,
+    router: Router,
+    routing_context: %{},
     pool_size: @default_pool_size,
     max_retries: @default_max_retries,
-    retry_delay: @default_retry_delay
+    retry_delay: @default_retry_delay,
+    routing_timeout: @default_routing_timeout,
+    # database => Table.t()
+    tables: %{},
+    # address => connection pool pid
+    servers: %{},
+    # monitor ref => address
+    monitors: %{},
+    # database => %{task: Task.t(), timer: reference(), waiters: [{from, kind}]}
+    refreshes: %{},
+    # database => monotonic ms of the last failed refresh
+    failed_at: %{}
   ]
-
-  # Public API
-
-  @doc """
-  Starts a routing pool.
-
-  ## Options
-
-  - `:uri` - The Neo4j cluster URI (required)
-  - `:auth` - Authentication options `[username: ..., password: ...]` (required)
-  - `:pool_size` - Number of connections per server (default: #{@default_pool_size})
-  - `:database` - Default database name (default: nil for default database)
-  - `:max_retries` - Maximum retry attempts for cluster errors (default: #{@default_max_retries})
-  - `:retry_delay` - Delay between retries in ms (default: #{@default_retry_delay})
-  - `:name` - GenServer name (optional)
-  """
-  def start_link(opts) do
-    name = Keyword.get(opts, :name)
-    GenServer.start_link(__MODULE__, opts, name: name)
-  end
-
-  @doc """
-  Executes a Cypher query on the cluster.
-
-  ## Options
-
-  - `:mode` - Access mode, `:read` or `:write` (default: `:write`)
-  - `:database` - Target database (default: pool's default database)
-  - `:bookmarks` - Transaction bookmarks for causal consistency
-  - `:timeout` - Query timeout in milliseconds
-  """
-  @spec query(GenServer.server(), String.t(), map(), keyword()) ::
-          {:ok, Response.t()} | {:error, Error.t() | term()}
-  def query(pool, statement, params \\ %{}, opts \\ []) do
-    GenServer.call(pool, {:query, statement, params, opts}, timeout_from_opts(opts))
-  end
-
-  @doc """
-  Executes a Cypher query, raising on error.
-  """
-  @spec query!(GenServer.server(), String.t(), map(), keyword()) :: Response.t()
-  def query!(pool, statement, params \\ %{}, opts \\ []) do
-    case query(pool, statement, params, opts) do
-      {:ok, result} -> result
-      {:error, error} -> raise error
-    end
-  end
-
-  @doc """
-  Gets the current routing table for a database.
-  """
-  @spec routing_table(GenServer.server(), String.t() | nil) ::
-          {:ok, Table.t()} | {:error, term()}
-  def routing_table(pool, database \\ nil) do
-    GenServer.call(pool, {:routing_table, database})
-  end
-
-  @doc """
-  Stops the routing pool.
-  """
-  @spec stop(GenServer.server()) :: :ok
-  def stop(pool) do
-    GenServer.stop(pool)
-  end
-
-  # GenServer callbacks
 
   # DBConnection options that should be forwarded to per-server pools
   @forwarded_db_connection_opts [
@@ -135,278 +103,449 @@ defmodule Boltx.Routing.Pool do
     :socket_options
   ]
 
+  # Public API
+
+  @doc """
+  Starts a routing pool.
+
+  ## Options
+
+  - `:uri` - The Neo4j cluster URI (required)
+  - `:auth` - Authentication options `[username: ..., password: ...]` (required)
+  - `:pool_size` - Number of connections per server (default: #{@default_pool_size})
+  - `:database` - Default database name (default: nil for default database)
+  - `:max_retries` - Maximum attempts for retryable cluster errors (default: #{@default_max_retries})
+  - `:retry_delay` - Delay between retries in ms (default: #{@default_retry_delay})
+  - `:routing_timeout` - Deadline in ms for fetching the routing table from one
+    router (default: #{@default_routing_timeout})
+  - `:routing_context` - Routing context sent with ROUTE (default: `%{}`)
+  - `:name` - GenServer name (optional)
+  """
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name))
+  end
+
+  @doc """
+  Executes a Cypher query on the cluster.
+
+  ## Options
+
+  - `:mode` - Access mode, `:read` or `:write` (default: `:write`)
+  - `:database` - Target database (default: pool's default database)
+  - `:bookmarks` - Transaction bookmarks for causal consistency
+  - `:timeout` - Query timeout in milliseconds (default: #{@default_timeout})
+  """
+  @spec query(GenServer.server(), String.t(), map(), keyword()) ::
+          {:ok, Boltx.Response.t()} | {:error, Error.t() | term()}
+  def query(pool, statement, params \\ %{}, opts \\ []) do
+    run(pool, statement, params, opts, Keyword.get(opts, :mode, :write), 0)
+  end
+
+  @doc """
+  Executes a Cypher query, raising on error.
+  """
+  @spec query!(GenServer.server(), String.t(), map(), keyword()) :: Boltx.Response.t()
+  def query!(pool, statement, params \\ %{}, opts \\ []) do
+    case query(pool, statement, params, opts) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
+  end
+
+  @doc """
+  Gets the current routing table for a database.
+  """
+  @spec routing_table(GenServer.server(), String.t() | nil) ::
+          {:ok, Table.t()} | {:error, term()}
+  def routing_table(pool, database \\ nil) do
+    call(pool, {:routing_table, database}, @default_timeout)
+  end
+
+  @doc """
+  Stops the routing pool.
+  """
+  @spec stop(GenServer.server()) :: :ok
+  def stop(pool) do
+    GenServer.stop(pool)
+  end
+
+  # Caller side: routing, execution and retries all run in the calling process.
+
+  defp run(pool, statement, params, opts, mode, attempt) do
+    request = {:route, Keyword.get(opts, :database), mode}
+
+    with {:ok, target} <- call(pool, request, Keyword.get(opts, :timeout, @default_timeout)) do
+      case execute(target, statement, params, opts, mode) do
+        {:retry, error, notice} ->
+          GenServer.cast(pool, notice)
+
+          if attempt + 1 < target.max_retries do
+            Process.sleep(target.retry_delay)
+            run(pool, statement, params, opts, mode, attempt + 1)
+          else
+            {:error, error}
+          end
+
+        result ->
+          result
+      end
+    end
+  end
+
+  defp execute(target, statement, params, opts, mode) do
+    query = %Boltx.Query{
+      statement: statement,
+      extra: %{
+        mode: if(mode == :read, do: "r", else: "w"),
+        db: target.database,
+        bookmarks: Keyword.get(opts, :bookmarks, [])
+      }
+    }
+
+    case DBConnection.execute(target.conn, query, params, opts) do
+      {:ok, _query, result} ->
+        {:ok, result}
+
+      {:error, %Error{} = error} ->
+        cond do
+          Error.not_a_leader?(error) ->
+            {:retry, error, {:write_failure, target.address, target.database}}
+
+          Error.retryable_cluster_error?(error) ->
+            {:retry, error, {:deactivate, target.address, target.database}}
+
+          true ->
+            {:error, error}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  catch
+    # The server's connection pool died between routing and checkout.
+    :exit, {_reason, {DBConnection.Holder, :checkout, _args}} ->
+      {:retry, Error.wrap(__MODULE__, :server_unavailable),
+       {:deactivate, target.address, target.database}}
+  end
+
+  # A GenServer call that cannot exit: a stalled or missing pool is an error
+  # the caller can handle, not a crash of the calling process.
+  defp call(pool, request, timeout) do
+    GenServer.call(pool, request, timeout)
+  catch
+    :exit, {:timeout, _} -> {:error, Error.wrap(__MODULE__, :routing_timeout)}
+    :exit, {reason, _} when reason in [:noproc, :normal, :shutdown] -> pool_down_error()
+    :exit, {{:shutdown, _}, _} -> pool_down_error()
+    :exit, _reason -> {:error, Error.wrap(__MODULE__, :routing_unavailable)}
+  end
+
+  defp pool_down_error, do: {:error, Error.wrap(__MODULE__, :pool_not_running)}
+
+  # GenServer callbacks
+
   @impl true
   def init(opts) do
-    uri = Keyword.fetch!(opts, :uri)
-    auth = Keyword.fetch!(opts, :auth)
+    # Supervisors are linked: if either dies, so does the pool, and its own
+    # supervisor restarts the lot cleanly.
+    Process.flag(:trap_exit, true)
+    {:ok, servers_sup} = DynamicSupervisor.start_link(strategy: :one_for_one)
+    {:ok, tasks_sup} = Task.Supervisor.start_link()
 
-    # Parse the initial address from URI
+    uri = Keyword.fetch!(opts, :uri)
     parsed_uri = URI.parse(uri)
-    initial_address = "#{parsed_uri.host}:#{parsed_uri.port || 7687}"
 
     # Preserve the full connection config so per-server pools inherit tuning
-    connection_opts =
-      Keyword.take(opts, @forwarded_db_connection_opts ++ @forwarded_boltx_opts)
-
     config =
-      [uri: uri, auth: auth] ++ connection_opts
+      [uri: uri, auth: Keyword.fetch!(opts, :auth)] ++
+        Keyword.take(opts, @forwarded_db_connection_opts ++ @forwarded_boltx_opts)
 
-    # Start the router
-    router_opts = [
-      initial_address: initial_address,
-      config: config
-    ]
-
-    {:ok, router} = Router.start_link(router_opts)
-
-    # Create ETS table for storing connection pools
-    pools_table = :ets.new(:server_pools, [:set, :public])
-
-    state = %__MODULE__{
-      router: router,
-      config: config,
-      database: Keyword.get(opts, :database),
-      pools_table: pools_table,
-      pool_size: Keyword.get(opts, :pool_size, @default_pool_size),
-      max_retries: Keyword.get(opts, :max_retries, @default_max_retries),
-      retry_delay: Keyword.get(opts, :retry_delay, @default_retry_delay)
-    }
-
-    {:ok, state}
+    {:ok,
+     %__MODULE__{
+       config: config,
+       initial_address: "#{parsed_uri.host}:#{parsed_uri.port || 7687}",
+       database: Keyword.get(opts, :database),
+       servers_sup: servers_sup,
+       tasks_sup: tasks_sup,
+       router: Keyword.get(opts, :router, Router),
+       routing_context: Keyword.get(opts, :routing_context, %{}),
+       pool_size: Keyword.get(opts, :pool_size, @default_pool_size),
+       max_retries: Keyword.get(opts, :max_retries, @default_max_retries),
+       retry_delay: Keyword.get(opts, :retry_delay, @default_retry_delay),
+       routing_timeout: Keyword.get(opts, :routing_timeout, @default_routing_timeout)
+     }}
   end
 
   @impl true
-  def handle_call({:query, statement, params, opts}, _from, state) do
-    mode = Keyword.get(opts, :mode, :write)
-    database = Keyword.get(opts, :database, state.database)
+  def handle_call({:route, database, mode}, from, state) do
+    database = database || state.database
+    table = Map.get(state.tables, database)
 
-    result = execute_with_routing(state, statement, params, opts, mode, database, 0)
-    {:reply, result, state}
+    case table && Table.servers_for(table, mode) do
+      servers when servers in [nil, []] ->
+        {:noreply, await_refresh(state, database, {from, {:route, mode}})}
+
+      servers ->
+        state = if Table.expired?(table), do: refresh_in_background(state, database), else: state
+        {reply, state} = target(state, Enum.random(servers), database)
+        {:reply, reply, state}
+    end
   end
 
-  def handle_call({:routing_table, database}, _from, state) do
-    result = Router.get_routing_table(state.router, database || state.database)
-    {:reply, result, state}
+  def handle_call({:routing_table, database}, from, state) do
+    database = database || state.database
+
+    case Map.get(state.tables, database) do
+      nil -> {:noreply, await_refresh(state, database, {from, :table})}
+      table -> {:reply, {:ok, table}, state}
+    end
   end
 
   @impl true
-  def terminate(_reason, state) do
-    # Stop all server pools
-    :ets.foldl(
-      fn {_address, pool}, _acc ->
-        try do
-          GenServer.stop(pool, :normal, 5000)
-        rescue
-          _ -> :ok
-        end
-      end,
-      nil,
-      state.pools_table
-    )
-
-    :ets.delete(state.pools_table)
-    :ok
+  def handle_cast({:write_failure, address, database}, state) do
+    Logger.debug("Routing: #{address} is no longer the leader for #{inspect(database)}")
+    {:noreply, update_table(state, database, &Table.remove_writer(&1, address))}
   end
 
-  # Private functions
+  def handle_cast({:deactivate, address, database}, state) do
+    Logger.debug("Routing: deactivating #{address} for #{inspect(database)}")
+    {:noreply, update_table(state, database, &Table.deactivate_server(&1, address))}
+  end
 
-  defp execute_with_routing(state, statement, params, opts, mode, database, retry_count)
-       when retry_count < state.max_retries do
-    # Ensure routing table is fresh
-    case Router.ensure_routing_table_fresh(state.router, database, mode) do
-      {:ok, _refreshed} ->
-        # Select a server for this operation
-        case Router.select_server(state.router, database, mode) do
-          {:ok, address} ->
-            execute_on_server(
-              state,
-              address,
-              statement,
-              params,
-              opts,
-              mode,
-              database,
-              retry_count
-            )
+  @impl true
+  def handle_info({ref, result}, state) when is_reference(ref) do
+    case refresh_by_ref(state, ref) do
+      {database, refresh} ->
+        Process.demonitor(ref, [:flush])
+        Process.cancel_timer(refresh.timer)
 
-          {:error, :no_writers_available} when mode == :write ->
-            # Refresh and retry
-            case Router.refresh_routing_table(state.router, database) do
-              {:ok, _table} ->
-                execute_with_routing(
-                  state,
-                  statement,
-                  params,
-                  opts,
-                  mode,
-                  database,
-                  retry_count + 1
-                )
+        result =
+          case result do
+            {:ok, %Table{}} -> result
+            {:error, _reason} -> result
+            other -> {:error, {:unexpected_routing_result, other}}
+          end
 
-              {:error, reason} ->
-                {:error, reason}
-            end
+        {:noreply, finish_refresh(state, database, result)}
 
-          {:error, reason} ->
-            {:error, reason}
-        end
+      nil ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
+    case {refresh_by_ref(state, ref), Map.pop(state.monitors, ref)} do
+      {{database, refresh}, _} ->
+        Process.cancel_timer(refresh.timer)
+        {:noreply, finish_refresh(state, database, {:error, {:refresh_crashed, reason}})}
+
+      {nil, {address, monitors}} when is_binary(address) ->
+        Logger.debug("Routing: connection pool for #{address} stopped: #{inspect(reason)}")
+        {:noreply, %{state | monitors: monitors, servers: Map.delete(state.servers, address)}}
+
+      _unknown ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:refresh_deadline, ref}, state) do
+    case refresh_by_ref(state, ref) do
+      {database, refresh} ->
+        Task.Supervisor.terminate_child(state.tasks_sup, refresh.task.pid)
+        Process.demonitor(ref, [:flush])
+        {:noreply, finish_refresh(state, database, {:error, :timeout})}
+
+      nil ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:EXIT, pid, reason}, %{servers_sup: pid} = state),
+    do: {:stop, reason, state}
+
+  def handle_info({:EXIT, pid, reason}, %{tasks_sup: pid} = state),
+    do: {:stop, reason, state}
+
+  def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
+
+  # Routing table refresh
+
+  defp await_refresh(state, database, waiter) do
+    state = start_refresh(state, database)
+    update_in(state.refreshes[database].waiters, &[waiter | &1])
+  end
+
+  defp refresh_in_background(state, database) do
+    failed_at = Map.get(state.failed_at, database)
+
+    if failed_at && now() - failed_at < @refresh_backoff,
+      do: state,
+      else: start_refresh(state, database)
+  end
+
+  defp start_refresh(%{refreshes: refreshes} = state, database)
+       when is_map_key(refreshes, database),
+       do: state
+
+  defp start_refresh(state, database) do
+    routers = routers_for(state, database)
+
+    task =
+      Task.Supervisor.async_nolink(state.tasks_sup, state.router, :fetch_table, [
+        routers,
+        state.config,
+        database,
+        state.routing_context,
+        state.routing_timeout
+      ])
+
+    deadline = state.routing_timeout * length(routers) + @refresh_slack
+    timer = Process.send_after(self(), {:refresh_deadline, task.ref}, deadline)
+
+    put_in(state.refreshes[database], %{task: task, timer: timer, waiters: []})
+  end
+
+  defp finish_refresh(state, database, result) do
+    {%{waiters: waiters}, refreshes} = Map.pop(state.refreshes, database)
+    state = %{state | refreshes: refreshes}
+
+    case result do
+      {:ok, %Table{} = table} ->
+        state =
+          %{
+            state
+            | tables: Map.put(state.tables, database, table),
+              failed_at: Map.delete(state.failed_at, database)
+          }
+          |> stop_unrouted_servers()
+
+        waiters
+        |> Enum.reverse()
+        |> Enum.reduce(state, fn {from, kind}, acc ->
+          {reply, acc} = reply_for(acc, table, database, kind)
+          GenServer.reply(from, reply)
+          acc
+        end)
 
       {:error, reason} ->
-        {:error, reason}
+        Logger.warning(
+          "Routing: could not refresh the routing table for #{inspect(database)}: " <>
+            inspect(reason)
+        )
+
+        error = routing_error(reason)
+        Enum.each(waiters, fn {from, _kind} -> GenServer.reply(from, {:error, error}) end)
+        %{state | failed_at: Map.put(state.failed_at, database, now())}
     end
   end
 
-  defp execute_with_routing(_state, _statement, _params, _opts, _mode, _database, _retry_count) do
-    {:error, Error.wrap(__MODULE__, :max_retries_exceeded)}
-  end
+  defp reply_for(state, table, _database, :table), do: {{:ok, table}, state}
 
-  defp execute_on_server(state, address, statement, params, opts, mode, database, retry_count) do
-    # Get or create a connection pool for this server
-    case get_or_create_pool(state, address) do
-      {:ok, pool} ->
-        # Build the query
-        extra = build_extra_params(opts, mode, database)
-        query = %Boltx.Query{statement: statement, extra: extra}
-
-        # Execute the query
-        case DBConnection.execute(pool, query, params, opts) do
-          {:ok, _query, result} ->
-            {:ok, result}
-
-          {:error, %Error{} = error} ->
-            handle_query_error(
-              state,
-              error,
-              address,
-              statement,
-              params,
-              opts,
-              mode,
-              database,
-              retry_count
-            )
-
-          {:error, reason} ->
-            {:error, reason}
-        end
-
-      {:error, reason} ->
-        # Server connection failed, try another server
-        Logger.debug("Routing: Failed to connect to #{address}: #{inspect(reason)}")
-        Router.deactivate_server(state.router, address, database)
-        execute_with_routing(state, statement, params, opts, mode, database, retry_count + 1)
+  defp reply_for(state, table, database, {:route, mode}) do
+    case Table.servers_for(table, mode) do
+      [] -> {{:error, Error.wrap(__MODULE__, no_servers_code(mode))}, state}
+      servers -> target(state, Enum.random(servers), database)
     end
   end
 
-  defp handle_query_error(
-         state,
-         error,
-         address,
-         statement,
-         params,
-         opts,
-         mode,
-         database,
-         retry_count
-       ) do
-    cond do
-      Error.not_a_leader?(error) ->
-        # Remove from writers and retry
-        Logger.debug("Routing: NotALeader error from #{address}, retrying on different server")
-        Router.on_write_failure(state.router, address, database)
-        Process.sleep(state.retry_delay)
-        execute_with_routing(state, statement, params, opts, mode, database, retry_count + 1)
+  defp no_servers_code(:write), do: :no_writers_available
+  defp no_servers_code(:read), do: :no_readers_available
 
-      Error.retryable_cluster_error?(error) ->
-        # Retry on different server
-        Logger.debug("Routing: Retryable cluster error from #{address}, retrying")
-        Router.deactivate_server(state.router, address, database)
-        Process.sleep(state.retry_delay)
-        execute_with_routing(state, statement, params, opts, mode, database, retry_count + 1)
-
-      true ->
-        # Non-retryable error
-        {:error, error}
-    end
-  end
-
-  defp get_or_create_pool(state, address) do
-    case :ets.lookup(state.pools_table, address) do
-      [{^address, pool}] ->
-        # Verify the pool is still alive
-        if Process.alive?(pool) do
-          {:ok, pool}
-        else
-          :ets.delete(state.pools_table, address)
-          create_and_store_pool(state, address)
-        end
-
-      [] ->
-        create_and_store_pool(state, address)
-    end
-  end
-
-  defp create_and_store_pool(state, address) do
-    case create_pool(state, address) do
-      {:ok, pool} ->
-        :ets.insert(state.pools_table, {address, pool})
-        {:ok, pool}
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
-
-  defp create_pool(state, address) do
-    {host, port} = parse_address(address)
-
-    # Build config for this server
-    # Extract scheme and SSL settings from original URI
-    original_uri = Keyword.get(state.config, :uri)
-    parsed_uri = URI.parse(original_uri)
-
-    # Forward all connection tuning options from the parent config
-    inherited_opts =
-      Keyword.take(state.config, @forwarded_db_connection_opts ++ @forwarded_boltx_opts)
-
-    pool_config =
-      inherited_opts ++
-        [
-          hostname: host,
-          port: port,
-          scheme: parsed_uri.scheme,
-          auth: Keyword.get(state.config, :auth),
-          pool_size: state.pool_size
-        ]
-
-    case Boltx.start_link(pool_config) do
-      {:ok, pool} ->
-        Logger.debug("Routing: Created connection pool for #{address}")
-        {:ok, pool}
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
-
-  defp parse_address(address) when is_binary(address) do
-    case String.split(address, ":") do
-      [host, port_str] -> {host, String.to_integer(port_str)}
-      [host] -> {host, 7687}
-    end
-  end
-
-  defp build_extra_params(opts, mode, database) do
-    mode_str = if mode == :read, do: "r", else: "w"
-
-    %{
-      mode: mode_str,
-      db: database,
-      bookmarks: Keyword.get(opts, :bookmarks, [])
+  defp routing_error(reason) do
+    %Error{
+      module: __MODULE__,
+      code: :routing_unavailable,
+      bolt: %{code: "Boltx.Routing.Unavailable", message: inspect(reason)}
     }
   end
 
-  defp timeout_from_opts(opts) do
-    Keyword.get(opts, :timeout, 30_000)
+  defp refresh_by_ref(state, ref) do
+    Enum.find(state.refreshes, fn {_database, refresh} -> refresh.task.ref == ref end)
   end
+
+  defp routers_for(state, database) do
+    case Map.get(state.tables, database) do
+      nil -> [state.initial_address]
+      table -> Enum.uniq(table.routers ++ [state.initial_address])
+    end
+  end
+
+  defp update_table(state, database, fun) do
+    case Map.get(state.tables, database) do
+      nil -> state
+      table -> %{state | tables: Map.put(state.tables, database, fun.(table))}
+    end
+  end
+
+  # Per-server connection pools
+
+  defp target(state, address, database) do
+    case server_pool(state, address) do
+      {:ok, conn, state} ->
+        {{:ok,
+          %{
+            conn: conn,
+            address: address,
+            database: database,
+            max_retries: state.max_retries,
+            retry_delay: state.retry_delay
+          }}, state}
+
+      {:error, reason} ->
+        Logger.warning(
+          "Routing: could not start a connection pool for #{address}: #{inspect(reason)}"
+        )
+
+        {{:error, Error.wrap(__MODULE__, :server_unavailable)},
+         update_table(state, database, &Table.deactivate_server(&1, address))}
+    end
+  end
+
+  defp server_pool(state, address) do
+    case Map.fetch(state.servers, address) do
+      {:ok, pid} ->
+        {:ok, pid, state}
+
+      :error ->
+        config =
+          address
+          |> Router.server_config(state.config)
+          |> Keyword.put(:pool_size, state.pool_size)
+
+        spec = %{id: address, start: {Boltx, :start_link, [config]}, restart: :temporary}
+
+        with {:ok, pid} <- DynamicSupervisor.start_child(state.servers_sup, spec) do
+          Logger.debug("Routing: created connection pool for #{address}")
+          ref = Process.monitor(pid)
+
+          {:ok, pid,
+           %{
+             state
+             | servers: Map.put(state.servers, address, pid),
+               monitors: Map.put(state.monitors, ref, address)
+           }}
+        end
+    end
+  end
+
+  # A server that left the cluster keeps its pool reconnecting forever unless
+  # it is stopped once no routing table lists it.
+  defp stop_unrouted_servers(state) do
+    routed = state.tables |> Map.values() |> Enum.flat_map(&Table.all_servers/1) |> MapSet.new()
+
+    {stale, kept} = Map.split_with(state.servers, fn {address, _} -> address not in routed end)
+
+    {stale_monitors, monitors} =
+      Map.split_with(state.monitors, fn {_ref, address} -> is_map_key(stale, address) end)
+
+    # Demonitor first, so a late :DOWN cannot evict a newer pool for the same address.
+    Enum.each(stale_monitors, fn {ref, _address} -> Process.demonitor(ref, [:flush]) end)
+
+    Enum.each(stale, fn {_address, pid} ->
+      DynamicSupervisor.terminate_child(state.servers_sup, pid)
+    end)
+
+    %{state | servers: kept, monitors: monitors}
+  end
+
+  defp now, do: System.monotonic_time(:millisecond)
 end
