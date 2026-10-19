@@ -16,6 +16,13 @@ defmodule Boltx.Routing.Pool do
       {:ok, result} = Boltx.Routing.Pool.query(pool, "MATCH (n) RETURN n", %{}, mode: :read)
       {:ok, result} = Boltx.Routing.Pool.query(pool, "CREATE (n:Test) RETURN n", %{})
 
+      {:ok, :saved, bookmark} =
+        Boltx.Routing.Pool.transaction(pool, fn tx ->
+          {:ok, _} = Boltx.Routing.Pool.query(tx, "CREATE (:Order {id: 1})")
+          {:ok, _} = Boltx.Routing.Pool.query(tx, "CREATE (:Item {order: 1})")
+          :saved
+        end)
+
   ## How it stays up
 
   The pool process only answers "which server, which connection pool" from
@@ -32,13 +39,23 @@ defmodule Boltx.Routing.Pool do
 
   Per-server connection pools live under a supervisor of their own. One that
   dies is started again on its next use; the routing pool itself is unaffected.
+
+  ## Transactions
+
+  `transaction/3` runs a function in one transaction on the leader: all of its
+  writes commit together or none do. **The function may run up to
+  `:max_retries` times** (a leader change, a deadlock: the server rolled the
+  attempt back), so it must only touch the graph — no messages, no other
+  database. A deadline bounds the whole of it: waiting for a connection,
+  BEGIN, the function and COMMIT. Only a COMMIT whose answer never came is
+  reported as possibly saved (`:commit_unknown`); that one is never retried.
   """
 
   use GenServer
   require Logger
 
   alias Boltx.Error
-  alias Boltx.Routing.{Router, Table}
+  alias Boltx.Routing.{Router, Table, Transaction}
 
   @default_pool_size 10
   @default_max_retries 3
@@ -135,9 +152,34 @@ defmodule Boltx.Routing.Pool do
   - `:bookmarks` - Transaction bookmarks for causal consistency
   - `:timeout` - Query timeout in milliseconds (default: #{@default_timeout})
   """
-  @spec query(GenServer.server(), String.t(), map(), keyword()) ::
+  @spec query(GenServer.server() | Transaction.t(), String.t(), map(), keyword()) ::
           {:ok, Boltx.Response.t()} | {:error, Error.t() | term()}
-  def query(pool, statement, params \\ %{}, opts \\ []) do
+  def query(pool_or_transaction, statement, params \\ %{}, opts \\ [])
+
+  # Inside a transaction: the leader connection BEGIN chose. A retryable error
+  # rolls the attempt back for `transaction/3` to run again, so the function
+  # never sees it. After any other error the transaction refuses every
+  # statement (`:transaction_failed`) and can only roll back.
+  def query(%Transaction{conn: conn, ref: ref}, statement, params, opts) do
+    case DBConnection.execute(conn, %Boltx.Query{statement: statement, extra: %{}}, params, opts) do
+      {:ok, _query, result} ->
+        {:ok, result}
+
+      {:error, %Error{} = error} ->
+        if Error.retryable_transaction_error?(error),
+          do: DBConnection.rollback(conn, {__MODULE__, :retry, error})
+
+        if Process.get({Transaction, ref, :error}) == nil,
+          do: Process.put({Transaction, ref, :error}, error)
+
+        {:error, error}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  def query(pool, statement, params, opts) do
     run(pool, statement, params, opts, Keyword.get(opts, :mode, :write), 0)
   end
 
@@ -151,6 +193,48 @@ defmodule Boltx.Routing.Pool do
       {:error, error} -> raise error
     end
   end
+
+  @doc """
+  Runs `fun` in one transaction on the leader and commits what it returns.
+
+  Read the moduledoc's "Transactions" first: `fun` may run more than once.
+
+  ## Options
+
+  - `:database` - Target database (default: pool's default database)
+  - `:bookmarks` - Bookmarks BEGIN waits for (causal consistency)
+  - `:deadline` - Absolute `System.monotonic_time(:millisecond)` by which the
+    transaction must be over; the server is told the time left (`tx_timeout`)
+  - `:timeout` - Used when there is no `:deadline` (default: #{@default_timeout})
+
+  ## Returns
+
+  - `{:ok, result, bookmark}` once committed (`bookmark` may be `nil`)
+  - `{:error, reason}` from `rollback/2`
+  - `{:error, error}` when it did not commit: the first error a statement
+    returned, or BEGIN's or COMMIT's
+  - `{:error, %Boltx.Error{code: :commit_unknown}}` when COMMIT's answer was
+    lost: it may have committed
+
+  A raise in `fun` rolls back and is raised again.
+  """
+  @spec transaction(GenServer.server(), (Transaction.t() -> result), keyword()) ::
+          {:ok, result, String.t() | nil} | {:error, term()}
+        when result: var
+  def transaction(pool, fun, opts \\ []) do
+    deadline =
+      Keyword.get_lazy(opts, :deadline, fn ->
+        now() + Keyword.get(opts, :timeout, @default_timeout)
+      end)
+
+    run_transaction(pool, fun, opts, deadline, 0)
+  end
+
+  @doc """
+  Rolls back the transaction: `transaction/3` returns `{:error, reason}`.
+  """
+  @spec rollback(Transaction.t(), term()) :: no_return()
+  def rollback(%Transaction{conn: conn}, reason), do: DBConnection.rollback(conn, reason)
 
   @doc """
   Gets the current routing table for a database.
@@ -226,6 +310,119 @@ defmodule Boltx.Routing.Pool do
     :exit, {_reason, {DBConnection.Holder, :checkout, _args}} ->
       {:retry, Error.wrap(__MODULE__, :server_unavailable),
        {:deactivate, target.address, target.database}}
+  end
+
+  defp run_transaction(pool, fun, opts, deadline, attempt) do
+    request = {:route, Keyword.get(opts, :database), :write}
+
+    with {:ok, target} <- call(pool, request, max(deadline - now(), 0)) do
+      case attempt_transaction(target, fun, opts, deadline) do
+        {:retry, error, notice} ->
+          if notice, do: GenServer.cast(pool, notice)
+
+          if attempt + 1 < target.max_retries and now() + target.retry_delay < deadline do
+            Process.sleep(target.retry_delay)
+            run_transaction(pool, fun, opts, deadline, attempt + 1)
+          else
+            {:error, error}
+          end
+
+        result ->
+          result
+      end
+    end
+  end
+
+  defp attempt_transaction(target, fun, opts, deadline) do
+    ref = make_ref()
+    tx = %Transaction{address: target.address, database: target.database, ref: ref}
+
+    begin = %{
+      mode: "w",
+      db: target.database,
+      bookmarks: Keyword.get(opts, :bookmarks, []),
+      tx_timeout: max(deadline - now(), 1)
+    }
+
+    # Set once `fun` has returned: an error after it is COMMIT's.
+    body = fn conn ->
+      result = fun.(%{tx | conn: conn})
+      Process.put({Transaction, ref}, :body_done)
+      result
+    end
+
+    Process.delete({Boltx.Connection, :bookmark})
+
+    try do
+      outcome =
+        try do
+          DBConnection.transaction(target.conn, body,
+            deadline: deadline,
+            timeout: :infinity,
+            extra_parameters: begin
+          )
+        rescue
+          error in [Error, DBConnection.ConnectionError] -> {:raised, error}
+        catch
+          # The server's connection pool died between routing and checkout.
+          :exit, {_reason, {DBConnection.Holder, :checkout, _args}} -> :checkout_exit
+        end
+
+      committing? = Process.get({Transaction, ref}) == :body_done
+      classify(outcome, target, committing?, Process.get({Transaction, ref, :error}))
+    after
+      Process.delete({Transaction, ref})
+      Process.delete({Transaction, ref, :error})
+      Process.delete({Boltx.Connection, :bookmark})
+    end
+  end
+
+  defp classify({:ok, result}, _target, _committing?, _failed),
+    do: {:ok, result, Process.get({Boltx.Connection, :bookmark})}
+
+  defp classify({:error, {__MODULE__, :retry, error}}, target, _committing?, _failed),
+    do: {:retry, error, notice(error, target)}
+
+  # COMMIT refused because a statement failed: that statement's error says why.
+  defp classify({:error, :rollback}, _target, _committing?, %Error{} = failed),
+    do: {:error, failed}
+
+  defp classify({:error, _reason} = result, _target, _committing?, _failed), do: result
+
+  # The server answered BEGIN or COMMIT with a FAILURE: nothing was committed.
+  defp classify({:raised, %Error{bolt: %{code: "Neo." <> _}} = error}, target, _committing?, _) do
+    if Error.retryable_transaction_error?(error),
+      do: {:retry, error, notice(error, target)},
+      else: {:error, error}
+  end
+
+  # A statement already failed, so the server's transaction was gone (RESET
+  # or a dead socket) before COMMIT: nothing was committed.
+  defp classify({:raised, _error}, _target, true, %Error{} = failed), do: {:error, failed}
+
+  # The connection failed with COMMIT in flight: it may have committed.
+  defp classify({:raised, error}, _target, true, _failed) do
+    {:error,
+     %Error{
+       module: __MODULE__,
+       code: :commit_unknown,
+       bolt: %{code: "Boltx.CommitUnknown", message: Exception.message(error)}
+     }}
+  end
+
+  defp classify({:raised, error}, _target, false, _failed), do: {:error, error}
+
+  defp classify(:checkout_exit, target, _committing?, _failed) do
+    {:retry, Error.wrap(__MODULE__, :server_unavailable),
+     {:deactivate, target.address, target.database}}
+  end
+
+  defp notice(error, target) do
+    cond do
+      Error.not_a_leader?(error) -> {:write_failure, target.address, target.database}
+      Error.retryable_cluster_error?(error) -> {:deactivate, target.address, target.database}
+      true -> nil
+    end
   end
 
   # A GenServer call that cannot exit: a stalled or missing pool is an error

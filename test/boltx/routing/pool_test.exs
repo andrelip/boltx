@@ -230,6 +230,289 @@ defmodule Boltx.Routing.PoolTest do
     end
   end
 
+  describe "transaction" do
+    setup do
+      label = "PoolTx#{System.unique_integer([:positive])}"
+      on_exit(fn -> cleanup(label) end)
+      %{label: label}
+    end
+
+    defp cleanup(label) do
+      {:ok, conn} = Boltx.start_link(direct_opts())
+      Boltx.query(conn, "MATCH (n:#{label}) DETACH DELETE n")
+    end
+
+    defp direct_opts, do: Boltx.TestHelper.opts() ++ [port: String.to_integer(port())]
+
+    defp count(pool, label, opts \\ []) do
+      {:ok, %{results: [%{"c" => c}]}} =
+        Pool.query(pool, "MATCH (n:#{label}) RETURN count(n) AS c", %{}, opts)
+
+      c
+    end
+
+    test "commits and returns the bookmark a later read can wait for", %{label: l} do
+      pool = start_pool()
+
+      assert {:ok, :saved, bookmark} =
+               Pool.transaction(pool, fn tx ->
+                 {:ok, _} = Pool.query(tx, "CREATE (:#{l} {n: 1})")
+                 {:ok, _} = Pool.query(tx, "CREATE (:#{l} {n: 2})")
+                 :saved
+               end)
+
+      assert is_binary(bookmark)
+      assert count(pool, l, mode: :read, bookmarks: [bookmark]) == 2
+
+      # BEGIN accepts it too
+      assert {:ok, 2, _} =
+               Pool.transaction(
+                 pool,
+                 fn tx ->
+                   {:ok, %{results: [%{"c" => c}]}} =
+                     Pool.query(tx, "MATCH (n:#{l}) RETURN count(n) AS c")
+
+                   c
+                 end,
+                 bookmarks: [bookmark]
+               )
+    end
+
+    test "sees its own writes; nobody else does until it commits", %{label: l} do
+      pool = start_pool()
+      {:ok, other} = Boltx.start_link(direct_opts())
+
+      assert {:ok, :ok, _} =
+               Pool.transaction(pool, fn tx ->
+                 {:ok, _} = Pool.query(tx, "CREATE (:#{l})")
+
+                 assert {:ok, %{results: [%{"c" => 1}]}} =
+                          Pool.query(tx, "MATCH (n:#{l}) RETURN count(n) AS c")
+
+                 assert %{results: [%{"c" => 0}]} =
+                          Boltx.query!(other, "MATCH (n:#{l}) RETURN count(n) AS c")
+
+                 :ok
+               end)
+
+      assert %{results: [%{"c" => 1}]} =
+               Boltx.query!(other, "MATCH (n:#{l}) RETURN count(n) AS c")
+    end
+
+    test "rollback/2 leaves nothing and returns its reason", %{label: l} do
+      pool = start_pool()
+
+      assert {:error, :changed_my_mind} =
+               Pool.transaction(pool, fn tx ->
+                 {:ok, _} = Pool.query(tx, "CREATE (:#{l})")
+                 Pool.rollback(tx, :changed_my_mind)
+               end)
+
+      assert count(pool, l) == 0
+    end
+
+    test "a failed statement makes it all fail, even if the function goes on", %{label: l} do
+      pool = start_pool()
+
+      result =
+        Pool.transaction(pool, fn tx ->
+          {:ok, _} = Pool.query(tx, "CREATE (:#{l} {n: 'a'})")
+          {:error, _} = Pool.query(tx, "RETURN 1/0")
+
+          assert {:error, %Error{code: :transaction_failed}} =
+                   Pool.query(tx, "CREATE (:#{l} {n: 'b'})")
+
+          {:ok, :pretending}
+        end)
+
+      assert {:error, %Error{bolt: %{code: "Neo.ClientError.Statement.ArithmeticError"}}} = result
+      assert count(pool, l) == 0
+      assert {:ok, _} = read_one(pool)
+    end
+
+    test "a raise rolls back and is raised again", %{label: l} do
+      pool = start_pool()
+
+      assert_raise RuntimeError, "boom", fn ->
+        Pool.transaction(pool, fn tx ->
+          {:ok, _} = Pool.query(tx, "CREATE (:#{l})")
+          raise "boom"
+        end)
+      end
+
+      assert count(pool, l) == 0
+    end
+
+    test "a server pool dead before BEGIN is dropped and the transaction runs again",
+         %{label: l} do
+      pool = start_pool()
+      assert {:ok, _} = read_one(pool)
+      [{address, server}] = Map.to_list(:sys.get_state(pool).servers)
+
+      :sys.suspend(pool)
+      Process.exit(server, :kill)
+      :sys.replace_state(pool, fn state -> %{state | servers: %{address => server}} end)
+      :sys.resume(pool)
+
+      runs = :counters.new(1, [])
+
+      assert {:ok, :ok, _} =
+               Pool.transaction(pool, fn tx ->
+                 :counters.add(runs, 1, 1)
+                 {:ok, _} = Pool.query(tx, "CREATE (:#{l})")
+                 :ok
+               end)
+
+      assert :counters.get(runs, 1) == 1
+      assert count(pool, l) == 1
+    end
+
+    test "a deadlock is retried: both transactions commit", %{label: l} do
+      pool = start_pool()
+      {:ok, _} = Pool.query(pool, "CREATE (:#{l} {k: 'a'}), (:#{l} {k: 'b'})")
+      test = self()
+
+      run = fn first, second ->
+        runs = :counters.new(1, [])
+
+        task =
+          Task.async(fn ->
+            Pool.transaction(pool, fn tx ->
+              :counters.add(runs, 1, 1)
+              {:ok, _} = Pool.query(tx, "MATCH (n:#{l} {k: '#{first}'}) SET n.v = 1")
+
+              # Only the first run waits for the other to hold its lock.
+              if :counters.get(runs, 1) == 1 do
+                send(test, {:locked, first})
+
+                receive do
+                  :go -> :ok
+                end
+              end
+
+              Pool.query(tx, "MATCH (n:#{l} {k: '#{second}'}) SET n.v = 1")
+            end)
+          end)
+
+        {task, runs}
+      end
+
+      {ab, ab_runs} = run.("a", "b")
+      {ba, ba_runs} = run.("b", "a")
+      assert_receive {:locked, "a"}, 5_000
+      assert_receive {:locked, "b"}, 5_000
+      send(ab.pid, :go)
+      send(ba.pid, :go)
+
+      assert {:ok, {:ok, _}, _} = Task.await(ab, 10_000)
+      assert {:ok, {:ok, _}, _} = Task.await(ba, 10_000)
+      assert Enum.sort([:counters.get(ab_runs, 1), :counters.get(ba_runs, 1)]) == [1, 2]
+    end
+
+    test "50 at once on 5 connections all commit", %{label: l} do
+      pool = start_pool()
+
+      results =
+        1..50
+        |> Enum.map(fn i ->
+          Task.async(fn ->
+            Pool.transaction(pool, fn tx -> Pool.query(tx, "CREATE (:#{l} {i: $i})", %{i: i}) end)
+          end)
+        end)
+        |> Task.await_many(30_000)
+
+      assert Enum.all?(results, &match?({:ok, {:ok, _}, _}, &1))
+      assert count(pool, l) == 50
+      assert {:ok, _} = read_one(pool)
+    end
+
+    test "a stalled router is an error, not an exit" do
+      {pool, _agent} = scripted_pool(:hang, routing_timeout: 5_000)
+
+      {ms, result} =
+        timed(fn -> Pool.transaction(pool, fn _tx -> :never end, timeout: 200) end)
+
+      assert {:error, %Error{code: :routing_timeout}} = result
+      assert ms < 1_000
+      assert Process.alive?(pool)
+    end
+
+    test "the deadline ends one stuck on a lock, and nothing commits", %{label: l} do
+      pool = start_pool()
+      {:ok, _} = Pool.query(pool, "CREATE (:#{l} {v: 0})")
+      {:ok, conn} = Boltx.start_link(direct_opts())
+      test = self()
+
+      holder =
+        Task.async(fn ->
+          Boltx.transaction(conn, fn tx ->
+            Boltx.query!(tx, "MATCH (n:#{l}) SET n.v = 1")
+            send(test, :lock_held)
+
+            receive do
+              :release -> Boltx.rollback(tx, :released)
+            end
+          end)
+        end)
+
+      assert_receive :lock_held, 5_000
+
+      {ms, result} =
+        timed(fn ->
+          Pool.transaction(
+            pool,
+            fn tx ->
+              case Pool.query(tx, "MATCH (n:#{l}) SET n.v = 2") do
+                {:ok, _} -> :written
+                {:error, error} -> Pool.rollback(tx, error)
+              end
+            end,
+            timeout: 500
+          )
+        end)
+
+      assert {:error, _} = result
+      assert ms < 2_000
+      send(holder.pid, :release)
+      Task.await(holder, 5_000)
+
+      assert {:ok, %{results: [%{"v" => 0}]}} =
+               Pool.query(pool, "MATCH (n:#{l}) RETURN n.v AS v", %{}, mode: :write)
+    end
+
+    # Neo4j 5.21 refuses writes to a read-only database with
+    # General.WriteOnReadOnlyAccessDatabase: an admin's setting, not a leader
+    # change, so it is not retried. (A follower's ForbiddenOnReadOnlyDatabase
+    # is, see the cluster test.)
+    test "a refusal that is not retryable runs the function once", %{label: l} do
+      pool = start_pool()
+      {:ok, conn} = Boltx.start_link(direct_opts())
+      Boltx.query!(conn, "CREATE DATABASE pooltestro IF NOT EXISTS WAIT", %{}, db: "system")
+      Boltx.query!(conn, "ALTER DATABASE pooltestro SET ACCESS READ ONLY WAIT", %{}, db: "system")
+      runs = :counters.new(1, [])
+
+      result =
+        Pool.transaction(
+          pool,
+          fn tx ->
+            :counters.add(runs, 1, 1)
+
+            case Pool.query(tx, "CREATE (:#{l})") do
+              {:ok, _} -> :written
+              {:error, error} -> Pool.rollback(tx, error)
+            end
+          end,
+          database: "pooltestro"
+        )
+
+      assert {:error,
+              %Error{bolt: %{code: "Neo.ClientError.General.WriteOnReadOnlyAccessDatabase"}}} =
+               result
+
+      assert :counters.get(runs, 1) == 1
+    end
+  end
+
   describe "routing_table/2" do
     test "returns the cached table" do
       pool = start_pool()
