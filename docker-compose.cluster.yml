@@ -1,0 +1,52 @@
+# A 3-primary Neo4j 5.21 cluster for test/boltx/routing/cluster_test.exs:
+#
+#   docker compose -f docker-compose.cluster.yml up -d   # forms in about a minute
+#   mix test --only cluster
+#
+# Each member's Bolt port is published on the host as itself (7701-7703), so
+# the routing table it returns is reachable from the tests. The memory caps
+# keep three members inside a laptop's Docker VM.
+x-core: &core
+  image: neo4j:5.21.0-enterprise-bullseye
+  mem_limit: 650m
+  environment: &env
+    NEO4J_AUTH: neo4j/boltxPassword
+    NEO4J_ACCEPT_LICENSE_AGREEMENT: "yes"
+    NEO4J_server_memory_heap_initial__size: 200m
+    NEO4J_server_memory_heap_max__size: 200m
+    NEO4J_server_memory_pagecache_size: 48m
+    NEO4J_initial_server_mode__constraint: PRIMARY
+    NEO4J_initial_dbms_default__primaries__count: "3"
+    NEO4J_dbms_cluster_discovery_endpoints: core1:5000,core2:5000,core3:5000
+
+services:
+  core1:
+    <<: *core
+    ports: ["7701:7701"]
+    environment:
+      <<: *env
+      NEO4J_server_discovery_advertised__address: core1:5000
+      NEO4J_server_cluster_advertised__address: core1:6000
+      NEO4J_server_routing_advertised__address: core1:7688
+      NEO4J_server_bolt_listen__address: ":7701"
+      NEO4J_server_bolt_advertised__address: localhost:7701
+  core2:
+    <<: *core
+    ports: ["7702:7702"]
+    environment:
+      <<: *env
+      NEO4J_server_discovery_advertised__address: core2:5000
+      NEO4J_server_cluster_advertised__address: core2:6000
+      NEO4J_server_routing_advertised__address: core2:7688
+      NEO4J_server_bolt_listen__address: ":7702"
+      NEO4J_server_bolt_advertised__address: localhost:7702
+  core3:
+    <<: *core
+    ports: ["7703:7703"]
+    environment:
+      <<: *env
+      NEO4J_server_discovery_advertised__address: core3:5000
+      NEO4J_server_cluster_advertised__address: core3:6000
+      NEO4J_server_routing_advertised__address: core3:7688
+      NEO4J_server_bolt_listen__address: ":7703"
+      NEO4J_server_bolt_advertised__address: localhost:7703

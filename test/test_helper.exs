@@ -6,7 +6,9 @@ exclude = [
   :skip,
   :bench,
   :apoc,
-  :legacy
+  :legacy,
+  # needs docker-compose.cluster.yml
+  :cluster
 ]
 
 include = [:core]
