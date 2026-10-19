@@ -2,6 +2,7 @@ defmodule Boltx.BoltProtocol.Message.BeginMessageTest do
   use ExUnit.Case, async: true
 
   alias Boltx.BoltProtocol.Message.BeginMessage
+  alias Boltx.BoltProtocol.MessageEncoder
 
   describe "BeginMessage.encode/2" do
     @tag :core
@@ -25,6 +26,12 @@ defmodule Boltx.BoltProtocol.Message.BeginMessageTest do
                  db: nil,
                  tx_metadata: nil
                })
+    end
+
+    @tag :core
+    test "keeps tx_timeout, so the server ends a transaction its client lost" do
+      assert BeginMessage.encode(5.0, %{tx_timeout: 100, other: 1}) ==
+               MessageEncoder.encode(0x11, [%{tx_timeout: 100}])
     end
 
     @tag :core

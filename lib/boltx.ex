@@ -195,7 +195,11 @@ defmodule Boltx do
           {:ok, result} | {:error, any}
         when result: var
   def transaction(conn, fun, opts \\ [], extra_parameters \\ %{}) do
+    # COMMIT leaves its bookmark here (`Boltx.Connection`); one server needs none.
+    Process.delete({Boltx.Connection, :bookmark})
     DBConnection.transaction(conn, fun, opts ++ [extra_parameters: extra_parameters])
+  after
+    Process.delete({Boltx.Connection, :bookmark})
   end
 
   @spec rollback(DBConnection.t(), any()) :: no_return()

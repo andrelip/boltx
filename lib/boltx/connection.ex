@@ -12,7 +12,11 @@ defmodule Boltx.Connection do
     :server_version,
     :hints,
     :patch_bolt,
-    :connection_id
+    :connection_id,
+    # :failed is a transaction whose statement failed: the RESET that cleared
+    # the server's FAILED state also ended its transaction, so any later RUN
+    # would auto-commit. Nothing more is sent until the rollback.
+    tx: :idle
   ]
 
   @impl true
@@ -26,26 +30,69 @@ defmodule Boltx.Connection do
     end
   end
 
+  # A connection that is not idle never begins (DBConnection disconnects it).
   @impl true
+  def handle_begin(_opts, %__MODULE__{tx: tx} = state) when tx != :idle,
+    do: {status(tx), state}
+
   def handle_begin(opts, %__MODULE__{client: client} = state) do
-    extra_parameters = opts[:extra_parameters] || %{}
-    {:ok, _} = Client.send_begin(client, extra_parameters)
-    {:ok, :began, state}
+    on_wire(state, fn ->
+      case Client.send_begin(client, opts[:extra_parameters] || %{}) do
+        {:ok, _} ->
+          {:ok, :began, %{state | tx: :transaction}}
+
+        {:error, %Boltx.Error{} = error} ->
+          reset_after_failure(client)
+          {:error, error, state}
+
+        {:error, reason} ->
+          {:disconnect, Boltx.Error.wrap(__MODULE__, reason), state}
+      end
+    end)
+  end
+
+  # `{:error, state}` makes DBConnection roll back: the transaction failed.
+  # COMMIT's bookmark goes to the caller's process dictionary, since
+  # DBConnection drops the commit result.
+  @impl true
+  def handle_commit(_opts, %__MODULE__{tx: :failed} = state), do: {:error, state}
+
+  def handle_commit(_opts, %__MODULE__{client: client} = state) do
+    on_wire(state, fn ->
+      case Client.send_commit(client) do
+        {:ok, metadata} ->
+          if bookmark = metadata["bookmark"], do: Process.put({__MODULE__, :bookmark}, bookmark)
+          {:ok, :committed, %{state | tx: :idle}}
+
+        # The server refused it (a timeout, say): nothing was committed.
+        {:error, %Boltx.Error{} = error} ->
+          reset_after_failure(client)
+          {:error, error, %{state | tx: :idle}}
+
+        # The socket died with COMMIT in flight: the outcome is unknown.
+        {:error, reason} ->
+          {:disconnect, Boltx.Error.wrap(__MODULE__, reason), state}
+      end
+    end)
   end
 
   @impl true
-  def handle_commit(_, %__MODULE__{client: client} = state) do
-    {:ok, _} = Client.send_commit(client)
-    {:ok, :committed, state}
+  def handle_rollback(_opts, %__MODULE__{tx: :failed} = state),
+    do: {:ok, :rolledback, %{state | tx: :idle}}
+
+  def handle_rollback(_opts, %__MODULE__{client: client} = state) do
+    on_wire(state, fn ->
+      case Client.send_rollback(client) do
+        {:ok, _} -> {:ok, :rolledback, %{state | tx: :idle}}
+        {:error, reason} -> {:disconnect, Boltx.Error.wrap(__MODULE__, reason), state}
+      end
+    end)
   end
 
   @impl true
-  def handle_rollback(_, %__MODULE__{client: client} = state) do
-    {:ok, _} = Client.send_rollback(client)
-    {:ok, :rolledback, state}
-  end
+  def handle_execute(_query, _params, _opts, %__MODULE__{tx: :failed} = state),
+    do: {:error, Boltx.Error.wrap(__MODULE__, :transaction_failed), state}
 
-  @impl true
   def handle_execute(query, params, opts, state) do
     case execute(query, params, opts, state) do
       {:ok, _} = result ->
@@ -98,12 +145,16 @@ defmodule Boltx.Connection do
   @impl true
   def handle_fetch(query, _cursor, _opts, state), do: {:cont, query, state}
   @impl true
-  def handle_status(_opts, state), do: {:idle, state}
+  def handle_status(_opts, %__MODULE__{tx: tx} = state), do: {status(tx), state}
+
+  defp status(:idle), do: :idle
+  defp status(:transaction), do: :transaction
+  defp status(:failed), do: :error
 
   defp execute(statement, params, _opts, state) do
     %__MODULE__{client: client} = state
 
-    case Client.run_statement(client, statement, params) do
+    case Client.run_statement(client, in_tx(statement, state), params) do
       {:ok, statement_result} ->
         {:ok, statement_result}
 
@@ -115,7 +166,7 @@ defmodule Boltx.Connection do
         # :syntax_error/:semantic_error, leaving constraint-violation and other
         # errors to poison the pooled connection.
         reset_after_failure(client)
-        {:error, error, state}
+        {:error, error, failed(state)}
 
       # Transport-level failures (socket closed, timeout, reset, ...) come back
       # as a bare `{:error, reason}` tuple. The pooled connection is now dead,
@@ -129,6 +180,26 @@ defmodule Boltx.Connection do
     # A raised exception inside execute/4 means the Bolt framing may be
     # desynced; the connection can no longer be trusted, so disconnect it.
     # Always return a 3-tuple to honour the DBConnection callback contract.
+    e in Boltx.Error ->
+      {:disconnect, e, state}
+
+    e ->
+      {:disconnect,
+       Boltx.Error.wrap(__MODULE__, %{code: "failure", message: Exception.message(e)}), state}
+  end
+
+  # Inside a transaction RUN carries no bookmarks, mode or db: BEGIN did.
+  defp in_tx(statement, %__MODULE__{tx: :transaction}), do: %{statement | extra: %{in_tx: true}}
+  defp in_tx(statement, _state), do: statement
+
+  defp failed(%__MODULE__{tx: :transaction} = state), do: %{state | tx: :failed}
+  defp failed(state), do: state
+
+  # A raise while talking to the server means the framing may be off: the
+  # connection can no longer be trusted, so it is dropped.
+  defp on_wire(state, fun) do
+    fun.()
+  rescue
     e in Boltx.Error ->
       {:disconnect, e, state}
 

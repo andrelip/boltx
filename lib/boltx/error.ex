@@ -21,7 +21,13 @@ defmodule Boltx.Error do
     # Database errors
     "Neo.ClientError.Database.DatabaseNotFound" => :database_not_found,
     "Neo.ClientError.Statement.ForbiddenOnReadOnlyDatabase" => :forbidden_on_read_only_database,
-    "Neo.TransientError.General.DatabaseUnavailable" => :database_unavailable
+    # Neo4j 5's code for the same refusal
+    "Neo.ClientError.General.ForbiddenOnReadOnlyDatabase" => :forbidden_on_read_only_database,
+    "Neo.TransientError.General.DatabaseUnavailable" => :database_unavailable,
+    # Transaction errors
+    "Neo.TransientError.Transaction.DeadlockDetected" => :deadlock_detected,
+    "Neo.ClientError.Transaction.TransactionTimedOut" => :transaction_timed_out,
+    "Neo.ClientError.Transaction.TransactionTimedOutClientConfiguration" => :transaction_timed_out
   }
 
   # Errors that indicate the query should be retried on a different server
@@ -80,6 +86,7 @@ defmodule Boltx.Error do
     else
       inspect(error, pretty: true)
     end
+
     # TODO: move to module.format_error(code) later
   end
 
@@ -103,6 +110,14 @@ defmodule Boltx.Error do
   end
 
   def retryable_cluster_error?(_), do: false
+
+  @doc """
+  Checks if a transaction that hit the error can be run again from the start:
+  a retryable cluster error, or a deadlock (the server already rolled it back).
+  """
+  @spec retryable_transaction_error?(t()) :: boolean()
+  def retryable_transaction_error?(%__MODULE__{code: :deadlock_detected}), do: true
+  def retryable_transaction_error?(error), do: retryable_cluster_error?(error)
 
   @doc """
   Checks if the error indicates a write failure that should

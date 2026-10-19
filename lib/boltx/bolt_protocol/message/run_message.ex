@@ -46,6 +46,8 @@ defmodule Boltx.BoltProtocol.Message.RunMessage do
     end
   end
 
+  defp get_extra_parameters(%{in_tx: true}), do: %{}
+
   defp get_extra_parameters(extra_parameters) do
     %{
       bookmarks: Map.get(extra_parameters, :bookmarks, []),

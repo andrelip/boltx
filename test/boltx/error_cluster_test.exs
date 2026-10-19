@@ -11,8 +11,12 @@ defmodule Boltx.ErrorClusterTest do
 
     test "to_atom/1 maps other cluster error codes" do
       assert Error.to_atom("Neo.ClientError.Cluster.Forbidden") == :cluster_forbidden
-      assert Error.to_atom("Neo.TransientError.Cluster.FeatureUnavailable") == :cluster_feature_unavailable
-      assert Error.to_atom("Neo.TransientError.Cluster.UnavailableClusterMember") == :cluster_member_unavailable
+
+      assert Error.to_atom("Neo.TransientError.Cluster.FeatureUnavailable") ==
+               :cluster_feature_unavailable
+
+      assert Error.to_atom("Neo.TransientError.Cluster.UnavailableClusterMember") ==
+               :cluster_member_unavailable
     end
 
     test "to_atom/1 returns :unknown for unmapped codes" do
@@ -31,8 +35,16 @@ defmodule Boltx.ErrorClusterTest do
 
     test "retryable_cluster_error?/1 returns true for retryable errors" do
       assert Error.retryable_cluster_error?(%Error{code: :not_a_leader, module: __MODULE__})
-      assert Error.retryable_cluster_error?(%Error{code: :cluster_member_unavailable, module: __MODULE__})
-      assert Error.retryable_cluster_error?(%Error{code: :forbidden_on_read_only_database, module: __MODULE__})
+
+      assert Error.retryable_cluster_error?(%Error{
+               code: :cluster_member_unavailable,
+               module: __MODULE__
+             })
+
+      assert Error.retryable_cluster_error?(%Error{
+               code: :forbidden_on_read_only_database,
+               module: __MODULE__
+             })
     end
 
     test "retryable_cluster_error?/1 returns false for non-retryable errors" do
@@ -42,7 +54,11 @@ defmodule Boltx.ErrorClusterTest do
 
     test "write_failure_error?/1 returns true for write failure errors" do
       assert Error.write_failure_error?(%Error{code: :not_a_leader, module: __MODULE__})
-      assert Error.write_failure_error?(%Error{code: :forbidden_on_read_only_database, module: __MODULE__})
+
+      assert Error.write_failure_error?(%Error{
+               code: :forbidden_on_read_only_database,
+               module: __MODULE__
+             })
     end
 
     test "write_failure_error?/1 returns false for other errors" do
@@ -55,7 +71,46 @@ defmodule Boltx.ErrorClusterTest do
         module: __MODULE__,
         bolt: %{code: "Neo.TransientError.Cluster.NotALeader", message: nil}
       }
+
       assert Error.transient_error?(error)
+    end
+
+    test "to_atom/1 maps the transaction and Neo4j 5 read-only codes" do
+      assert Error.to_atom("Neo.TransientError.Transaction.DeadlockDetected") ==
+               :deadlock_detected
+
+      assert Error.to_atom("Neo.ClientError.Transaction.TransactionTimedOut") ==
+               :transaction_timed_out
+
+      assert Error.to_atom("Neo.ClientError.Transaction.TransactionTimedOutClientConfiguration") ==
+               :transaction_timed_out
+
+      assert Error.to_atom("Neo.ClientError.General.ForbiddenOnReadOnlyDatabase") ==
+               :forbidden_on_read_only_database
+
+      assert Error.to_atom("Neo.ClientError.Statement.ForbiddenOnReadOnlyDatabase") ==
+               :forbidden_on_read_only_database
+    end
+
+    test "retryable_transaction_error?/1 adds deadlocks to the cluster errors" do
+      assert Error.retryable_transaction_error?(%Error{
+               code: :deadlock_detected,
+               module: __MODULE__
+             })
+
+      assert Error.retryable_transaction_error?(%Error{code: :not_a_leader, module: __MODULE__})
+
+      refute Error.retryable_transaction_error?(%Error{
+               code: :transaction_timed_out,
+               module: __MODULE__
+             })
+
+      refute Error.retryable_transaction_error?(%Error{
+               code: :transaction_failed,
+               module: __MODULE__
+             })
+
+      refute Error.retryable_transaction_error?(:closed)
     end
 
     test "transient_error?/1 returns false for client errors" do
@@ -64,6 +119,7 @@ defmodule Boltx.ErrorClusterTest do
         module: __MODULE__,
         bolt: %{code: "Neo.ClientError.Cluster.NotALeader", message: nil}
       }
+
       refute Error.transient_error?(error)
     end
   end

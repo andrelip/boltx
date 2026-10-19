@@ -20,7 +20,7 @@ defmodule Boltx.BoltProtocol.Message.BeginMessage do
   end
 
   defp get_extra_parameters(extra_parameters) do
-    keys_to_extract = [:bookmarks, :mode, :db, :tx_metadata]
+    keys_to_extract = [:bookmarks, :mode, :db, :tx_metadata, :tx_timeout]
     Map.take(extra_parameters, keys_to_extract)
   end
 end
