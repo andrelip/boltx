@@ -77,7 +77,7 @@ defmodule Boltx.Error do
 
   """
   @spec message(t()) :: String.t()
-  def message(%__MODULE__{code: code, module: module} = error) do
+  def message(%__MODULE__{code: code} = error) do
     if code == :syntax_error do
       """
       Syntax error
